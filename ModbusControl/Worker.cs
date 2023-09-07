@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Options;
 using ModbusControl.Models;
+using ModbusControl.Services;
 using SharpModbus;
 using System.Collections.Concurrent;
 
@@ -10,7 +11,8 @@ public class Worker : BackgroundService
 	private readonly ILogger<Worker> _logger;
 	private readonly MQTTConfiguration _mqttOptions;
 	private readonly RegistersConfiguration _registersOptions;
-	private ConcurrentDictionary<string, ModbusMaster> _hubs;
+	private ConcurrentDictionary<string, ModbusHub> _hubs;
+	private ConcurrentDictionary<string, HubCache> _hubCache;
 
 	public Worker(ILogger<Worker> logger, 
 		IOptions<MQTTConfiguration> mqttOptions,
@@ -19,68 +21,67 @@ public class Worker : BackgroundService
 		_logger = logger;
 		_mqttOptions = mqttOptions.Value;
 		_registersOptions = registersOptions.Value;
-		_hubs = new ConcurrentDictionary<string, ModbusMaster>();
+		_hubs = new ConcurrentDictionary<string, ModbusHub>();
 	}
 
 	protected override async Task ExecuteAsync(CancellationToken stoppingToken)
 	{
-		await Task.WhenAll(_registersOptions.Registers.Select(r => Task.Run(() => ReadRegisters(r, stoppingToken))));
+		await Task.WhenAll(_registersOptions.Registers.Select(r => Task.Run(() => ReadRegistersAsync(r, stoppingToken))));
 	}
 
-	private async Task ReadRegisters(Register register, CancellationToken stoppingToken)
+	private async Task ReadRegistersAsync(Register register, CancellationToken stoppingToken)
 	{
 		while (!stoppingToken.IsCancellationRequested)
 		{
+			ModbusHub? client = null;
 			try
 			{
-				if (!_hubs.TryGetValue(register.Hub, out var client))
+				ModbusHub? hub = _hubs.GetOrAdd(register.Hub, (string key) =>
 				{
-					Thread.Sleep(2000);
-					client = ModbusConnection.GetModbusClient();
-					continue;
+					var hubOpt = _registersOptions.Hubs.FirstOrDefault(h => h.Name == register.Hub);
+					if (hubOpt == null)
+						return null;
+					Thread.Sleep(hubOpt.ConnectionDelay * 1000);
+					return ModbusHub.GetModbusHub(hubOpt.Ip, hubOpt.Port);
+				});
+
+				if (hub == null)
+				{
+					_logger.LogError($"Can't find a hub with name {register.Hub}");
+					return;
 				}
 
-				var newResultTask = ModbusConnection.ReadHoldingsAsync(client, register.Slave, register.StartAddress, register.RegisterCount);
+				var newResultTask = client.ReadHoldingsAsync(register.Slave, register.StartAddress, register.RegisterCount);
 				var winner = await Task.WhenAny(
 					newResultTask,
 					Task.Delay(TimeSpan.FromSeconds(2)));
-				if (winner == newResultTask)
+				if (winner != newResultTask)
 				{
-					var newResult = newResultTask.Result;
-
-					if (newResultTask.IsFaulted || newResult == null || newResult.Length != register.RegisterCount)
-					{
-						throw new Exception("Failed to read registers");
-					}
-
-					/*for (int i = 0; i < registerCount; i++)
-					{
-						if (result[i] != newResult[i])
-						{
-		//					Console.WriteLine($"Value register {startAddress + i} changed to {newResult[i]}");
-							result[i] = newResult[i];
-							await Client_Publish_Samples.Publish_Application_Message(slaveId, startAddress + i, newResult[i] ? (byte)1 : (byte)0);
-						}
-					}*/
+					throw new TimeoutException();
 				}
-				else
+				var newResult = newResultTask.Result;
+
+				if (newResultTask.IsFaulted || newResult == null || newResult.Length != register.RegisterCount)
 				{
-					Console.WriteLine($"Task is timed out");
-					client?.Dispose();
-					client = null;
+					throw new Exception("Failed to read registers");
+				}
+
+				var cache = _hubCache.GetOrAdd(register.Hub, (string key) => new HubCache());
+				for (ushort i = 0; i < register.RegisterCount; i++)
+				{
+					if (!cache.CheckAndUpdateValue(register.Slave, (ushort)(register.StartAddress + i), newResult[i]))
+					{
+						await MqttClient.Publish_Application_Message(register.Slave, register.StartAddress + i, newResult[i]);
+					}
 				}
 			}
 			catch (Exception e)
 			{
 				_logger.LogError(e, "Failed to read from hub");
-				Console.WriteLine($"{e.Message}");
-				client?.Dispose();
-				client = null;
+				_hubs[register.Hub]?.Dispose();
+				_hubs.TryRemove(register.Hub, out client);
 			}
-			var milliseconds = 500;
 			await Task.Delay(register.Delay , stoppingToken);
 		}
 	}
-
-	private int Get
 }

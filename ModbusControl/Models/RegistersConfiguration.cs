@@ -17,6 +17,8 @@ namespace ModbusControl.Models
 		public string Name { get; set; }
 		public string Ip { get; set; }
 		public int Port { get; set; }
+		public int ConnectionDelay { get; set; }
+		public int Timeout { get; set; }
 	}
 
 	public class Register
