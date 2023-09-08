@@ -77,7 +77,7 @@ public class Worker : BackgroundService
 			}
 			catch (Exception e)
 			{
-				_logger.LogError(e, "Failed to read from hub");
+				_logger.LogError(e, "Failed to read from modbus hub");
 				_hubs[register.Hub]?.Dispose();
 				_hubs.TryRemove(register.Hub, out client);
 			}
